@@ -22,7 +22,7 @@ use mc_util_grpc::{
 };
 use mc_util_uri::ConnectionUri;
 use mc_watcher::watcher_db::WatcherDB;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Debug, Display)]
 pub enum LedgerServerError {
@@ -78,6 +78,23 @@ pub struct LedgerServer<E: LedgerEnclaveProxy, R: RaClient + Send + Sync + 'stat
 }
 
 impl<E: LedgerEnclaveProxy, R: RaClient + Send + Sync + 'static> LedgerServer<E, R> {
+    /// These constants control the polling and retry frequencies of services
+    /// that attempt to get a timestamp from blocks in the ledger.
+    ///
+    /// Poll for new data every 10 ms
+    const POLLING_FREQUENCY: Duration = Duration::from_millis(10);
+    /// If a database invariant is violated, e.g. we get block but not block
+    /// contents, it typically will not be fixed and so we won't be able to
+    /// proceed. But bringing the server down is costly from ops POV because
+    /// we will lose all the user rng's.
+    ///
+    /// So instead, if this happens, we log an error, and retry in 1s.
+    /// This avoids logging at > 1hz when there is this error, which would be
+    /// very spammy. But the retries are unlikely to eventually lead to
+    /// progress. Another strategy might be for the server to enter a
+    /// "paused" state and signal for intervention.
+    const ERROR_RETRY_FREQUENCY: Duration = Duration::from_millis(1000);
+
     pub fn new(
         config: LedgerServerConfig,
         enclave: E,
@@ -104,6 +121,9 @@ impl<E: LedgerEnclaveProxy, R: RaClient + Send + Sync + 'static> LedgerServer<E,
             enclave.clone(),
             client_authenticator.clone(),
             logger.clone(),
+            config.watcher_timeout,
+            Self::POLLING_FREQUENCY,
+            Self::ERROR_RETRY_FREQUENCY,
         );
         let merkle_proof_service = MerkleProofService::new(
             ledger.clone(),
@@ -116,12 +136,18 @@ impl<E: LedgerEnclaveProxy, R: RaClient + Send + Sync + 'static> LedgerServer<E,
             watcher.clone(),
             client_authenticator.clone(),
             logger.clone(),
+            config.watcher_timeout,
+            Self::POLLING_FREQUENCY,
+            Self::ERROR_RETRY_FREQUENCY,
         );
         let untrusted_tx_out_service = UntrustedTxOutService::new(
             ledger,
             watcher,
             client_authenticator.clone(),
             logger.clone(),
+            config.watcher_timeout,
+            Self::POLLING_FREQUENCY,
+            Self::ERROR_RETRY_FREQUENCY,
         );
 
         Self {

@@ -53,6 +53,12 @@ pub struct LedgerServerConfig {
     /// hours).
     #[structopt(long, default_value = "86400", parse(try_from_str=parse_duration_in_seconds))]
     pub client_auth_token_max_lifetime: Duration,
+
+    /// The amount of time we wait for the watcher db to catchup if it falls
+    /// behind If this timeout is exceeded then the ETxOut's will have no
+    /// timestamp
+    #[structopt(long, default_value = "5", parse(try_from_str=parse_duration_in_seconds))]
+    pub watcher_timeout: Duration,
 }
 
 /// Converts a string containing number of seconds to a Duration object.

@@ -97,6 +97,7 @@ fn fog_ledger_merkle_proofs_test(logger: Logger) {
             ias_api_key: Default::default(),
             client_auth_token_secret: None,
             client_auth_token_max_lifetime: Default::default(),
+            watcher_timeout: Default::default(),
         };
 
         let enclave = LedgerSgxEnclave::new(
@@ -250,6 +251,7 @@ fn fog_ledger_key_images_test(logger: Logger) {
             ias_api_key: Default::default(),
             client_auth_token_secret: None,
             client_auth_token_max_lifetime: Default::default(),
+            watcher_timeout: Default::default(),
         };
 
         let enclave = LedgerSgxEnclave::new(
@@ -406,6 +408,7 @@ fn fog_ledger_blocks_api_test(logger: Logger) {
             ias_api_key: Default::default(),
             client_auth_token_secret: None,
             client_auth_token_max_lifetime: Default::default(),
+            watcher_timeout: Default::default(),
         };
 
         let enclave = LedgerSgxEnclave::new(
@@ -543,6 +546,7 @@ fn fog_ledger_untrusted_tx_out_api_test(logger: Logger) {
             ias_api_key: Default::default(),
             client_auth_token_secret: None,
             client_auth_token_max_lifetime: Default::default(),
+            watcher_timeout: Default::default(),
         };
 
         let enclave = LedgerSgxEnclave::new(

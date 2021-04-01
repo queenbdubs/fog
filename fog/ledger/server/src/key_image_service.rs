@@ -17,7 +17,11 @@ use mc_util_grpc::{
 use mc_util_metrics::SVC_COUNTERS;
 use mc_watcher::watcher_db::WatcherDB;
 use mc_watcher_api::TimestampResultCode;
-use std::{convert::From, sync::Arc};
+use std::{
+    convert::From,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 // Maximum number of Key Images that may be checked in a single request.
 pub const MAX_REQUEST_SIZE: usize = 2000;
@@ -29,6 +33,9 @@ pub struct KeyImageService<L: Ledger + Clone, E: LedgerEnclaveProxy> {
     enclave: E,
     authenticator: Arc<dyn Authenticator + Send + Sync>,
     logger: Logger,
+    watcher_timeout: Duration,
+    polling_frequency: Duration,
+    error_retry_frequency: Duration,
 }
 
 impl<L: Ledger + Clone, E: LedgerEnclaveProxy> KeyImageService<L, E> {
@@ -38,6 +45,9 @@ impl<L: Ledger + Clone, E: LedgerEnclaveProxy> KeyImageService<L, E> {
         enclave: E,
         authenticator: Arc<dyn Authenticator + Send + Sync>,
         logger: Logger,
+        watcher_timeout: Duration,
+        polling_frequency: Duration,
+        error_retry_frequency: Duration,
     ) -> Self {
         Self {
             ledger,
@@ -45,6 +55,9 @@ impl<L: Ledger + Clone, E: LedgerEnclaveProxy> KeyImageService<L, E> {
             enclave,
             authenticator,
             logger,
+            watcher_timeout,
+            polling_frequency,
+            error_retry_frequency,
         }
     }
 
@@ -136,26 +149,68 @@ impl<L: Ledger + Clone, E: LedgerEnclaveProxy> KeyImageService<L, E> {
                             (u64::MAX, KeyImageResultCode::KeyImageError)
                         }
                     };
-                    // Get the timestamp of the spent_at block
-                    let (timestamp, ts_result): (u64, TimestampResultCode) =
-                        match self.watcher.get_block_timestamp(spent_at) {
-                            Ok((ts, res)) => (ts, res),
+
+                    // Timer that tracks how long we have had WatcherBehind error for,
+                    // if this exceeds watcher_timeout, we log a warning.
+                    let mut watcher_behind_timer = Instant::now();
+
+                    // Get the timestamp of the block_index if possible
+                    let (mut timestamp, mut ts_result): (Option<u64>, Option<TimestampResultCode>);
+                    loop {
+                        let timestamp_result_code = match self.watcher.get_block_timestamp(spent_at) {
+                            Ok((ts, res)) => match res {
+                                TimestampResultCode::WatcherBehind => {
+                                    if watcher_behind_timer.elapsed() > self.watcher_timeout {
+                                        log::warn!(self.logger, "watcher is still behind on block index = {} after waiting {} seconds, ingest will be blocked", spent_at, self.watcher_timeout.as_secs());
+                                        watcher_behind_timer = Instant::now();
+                                    }
+                                    std::thread::sleep(self.polling_frequency);
+                                    (None, None)
+                                }
+                                TimestampResultCode::BlockIndexOutOfBounds => {
+                                    log::warn!(self.logger, "block index {} was out of bounds, we should not be scanning it, we will have junk timestamps for it", spent_at);
+                                    (Some(u64::MAX), Some(res))
+                                }
+                                TimestampResultCode::Unavailable => {
+                                    log::crit!(self.logger, "watcher configuration is wrong and timestamps will not be available with this configuration. Ingest is blocked at block index {}", spent_at);
+                                    std::thread::sleep(self.error_retry_frequency);
+                                    (None, None)
+                                }
+                                TimestampResultCode::WatcherDatabaseError => {
+                                    log::crit!(self.logger, "The watcher database has an error which prevents us from getting timestamps. Ingest is blocked at block index {}", spent_at);
+                                    std::thread::sleep(self.error_retry_frequency);
+                                    (None, None)
+                                }
+                                TimestampResultCode::TimestampFound => {
+                                    (Some(ts), Some(res))
+                                }
+                            },
                             Err(err) => {
                                 log::error!(
                                     self.logger,
-                                    "Could not obtain timestamp for block {} due to error {:?}",
+                                    "Could not obtain timestamp for block {} due to error {}, this may mean the watcher is not correctly configured. will retry",
                                     spent_at,
                                     err
                                 );
-                                (u64::MAX, TimestampResultCode::WatcherDatabaseError)
+                                std::thread::sleep(self.error_retry_frequency);
+                                (None, None)
                             }
                         };
+
+                        timestamp = timestamp_result_code.0;
+                        ts_result = timestamp_result_code.1;
+
+                        if timestamp.is_some() && ts_result.is_some() {
+                            // Found a timestamp. Break from the loop.
+                            break;
+                        }
+                    }
 
                     KeyImageResult {
                         key_image: *key_image,
                         spent_at,
-                        timestamp,
-                        timestamp_result_code: ts_result as u32,
+                        timestamp: timestamp.unwrap(),
+                        timestamp_result_code: ts_result.unwrap() as u32,
                         key_image_result_code: ki_result as u32,
                     }
                 })

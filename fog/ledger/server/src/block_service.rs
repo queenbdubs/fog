@@ -12,7 +12,10 @@ use mc_util_grpc::{rpc_database_err, rpc_logger, send_result, Authenticator};
 use mc_util_metrics::SVC_COUNTERS;
 use mc_watcher::watcher_db::WatcherDB;
 use mc_watcher_api::TimestampResultCode;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone)]
 pub struct BlockService<L: Ledger + Clone> {
@@ -20,6 +23,9 @@ pub struct BlockService<L: Ledger + Clone> {
     watcher: WatcherDB,
     authenticator: Arc<dyn Authenticator + Send + Sync>,
     logger: Logger,
+    watcher_timeout: Duration,
+    polling_frequency: Duration,
+    error_retry_frequency: Duration,
 }
 
 impl<L: Ledger + Clone> BlockService<L> {
@@ -28,12 +34,18 @@ impl<L: Ledger + Clone> BlockService<L> {
         watcher: WatcherDB,
         authenticator: Arc<dyn Authenticator + Send + Sync>,
         logger: Logger,
+        watcher_timeout: Duration,
+        polling_frequency: Duration,
+        error_retry_frequency: Duration,
     ) -> Self {
         Self {
             ledger,
             watcher,
             authenticator,
             logger,
+            watcher_timeout,
+            polling_frequency,
+            error_retry_frequency,
         }
     }
 
@@ -76,10 +88,39 @@ impl<L: Ledger + Clone> BlockService<L> {
         result.index = block_index;
         result.global_txo_count = block.cumulative_txo_count;
 
+        // Timer that tracks how long we have had WatcherBehind error for,
+        // if this exceeds watcher_timeout, we log a warning.
+        let mut watcher_behind_timer = Instant::now();
+
         // Get the timestamp of the block_index if possible
-        let (timestamp, ts_result): (u64, TimestampResultCode) =
-            match self.watcher.get_block_timestamp(block_index) {
-                Ok((ts, res)) => (ts, res),
+        let (mut timestamp, mut ts_result): (Option<u64>, Option<TimestampResultCode>);
+        loop {
+            let timestamp_result_code = match self.watcher.get_block_timestamp(block_index) {
+                Ok((ts, res)) => match res {
+                    TimestampResultCode::WatcherBehind => {
+                        if watcher_behind_timer.elapsed() > self.watcher_timeout {
+                            log::warn!(self.logger, "watcher is still behind on block index = {} after waiting {} seconds, ingest will be blocked", block_index, self.watcher_timeout.as_secs());
+                            watcher_behind_timer = Instant::now();
+                        }
+                        std::thread::sleep(self.polling_frequency);
+                        (None, None)
+                    }
+                    TimestampResultCode::BlockIndexOutOfBounds => {
+                        log::warn!(self.logger, "block index {} was out of bounds, we should not be scanning it, we will have junk timestamps for it", block_index);
+                        (Some(u64::MAX), Some(res))
+                    }
+                    TimestampResultCode::Unavailable => {
+                        log::crit!(self.logger, "watcher configuration is wrong and timestamps will not be available with this configuration. Ingest is blocked at block index {}", block_index);
+                        std::thread::sleep(self.error_retry_frequency);
+                        (None, None)
+                    }
+                    TimestampResultCode::WatcherDatabaseError => {
+                        log::crit!(self.logger, "The watcher database has an error which prevents us from getting timestamps. Ingest is blocked at block index {}", block_index);
+                        std::thread::sleep(self.error_retry_frequency);
+                        (None, None)
+                    }
+                    TimestampResultCode::TimestampFound => (Some(ts), Some(res)),
+                },
                 Err(err) => {
                     log::error!(
                         self.logger,
@@ -87,12 +128,22 @@ impl<L: Ledger + Clone> BlockService<L> {
                         block_index,
                         err
                     );
-                    (u64::MAX, TimestampResultCode::WatcherDatabaseError)
+                    std::thread::sleep(self.error_retry_frequency);
+                    (None, None)
                 }
             };
 
-        result.timestamp = timestamp;
-        result.timestamp_result_code = ts_result as u32;
+            timestamp = timestamp_result_code.0;
+            ts_result = timestamp_result_code.1;
+
+            if timestamp.is_some() && ts_result.is_some() {
+                // Found a timestamp. Break from the loop.
+                break;
+            }
+        }
+
+        result.timestamp = timestamp.unwrap();
+        result.timestamp_result_code = ts_result.unwrap() as u32;
 
         Ok(result)
     }
